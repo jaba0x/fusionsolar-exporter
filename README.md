@@ -17,10 +17,9 @@
 
 `fusionsolar-exporter` does that for [Huawei FusionSolar](https://solar.huawei.com/). It signs in to the FusionSolar portal the same way your browser does, reads the same JSON the portal pages use, and exposes it as metrics. From there you can graph it in [Grafana](https://grafana.com/), alert on it, and keep history for as long as you like.
 
-```
-FusionSolar portal  ->  fusionsolar-exporter  ->  Prometheus  ->  Grafana
-                         :9850/metrics
-```
+<p align="center">
+  <img src="assets/flow.svg" width="900" alt="FusionSolar portal to fusionsolar-exporter (port 9850, /metrics) to Prometheus to Grafana">
+</p>
 
 ## Why another exporter
 
