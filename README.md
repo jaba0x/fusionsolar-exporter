@@ -32,6 +32,7 @@ This exporter needs nothing more than that regular user, and it gets:
 - Per string PV voltage, current and power, and total DC input
 - Per phase grid voltage and current
 - Active alarm counts by severity
+- The alarm list and inverter status changes as JSON, for tools that keep a device log
 - All plants the user can see, discovered automatically
 
 ## Quick start
@@ -92,7 +93,9 @@ Everything is set with environment variables.
 | `PV_STRINGS` | `8` | Number of PV string inputs to read per inverter |
 | `INVENTORY_TTL_SECONDS` | `21600` | How often the device list is refreshed |
 | `LOGIN_BACKOFF_SECONDS` | `1800` | Wait time after a failed login |
-| `LISTEN_PORT` | `9850` | Port for `/metrics` |
+| `ALARM_INTERVAL_SECONDS` | `300` | How often the alarm list is read |
+| `ALARM_HISTORY_DAYS` | `3650` | How far back alarms are read on the first run |
+| `LISTEN_PORT` | `9850` | Port for `/metrics` and the JSON endpoints |
 | `LOG_LEVEL` | `INFO` | Python log level |
 
 If the password contains `#` or `$`, wrap it in single quotes in `.env`.
@@ -134,6 +137,47 @@ All metrics are gauges unless noted.
 | `fusionsolar_inverter_phase_current_amps` | inverter, `phase` | Grid phase current (A, B, C) |
 
 Plant labels are `station_code` and `station_name`. Inverter labels add `device_id` and `device_name`.
+
+## Alarms and status changes
+
+Prometheus stores numbers, so messages are served separately as JSON on the same port. Anything that wants a device log (a small web app, a script, a cron job) can read them.
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/alarms` | Active alarms and the alarm history the portal still has |
+| `GET /api/alarms?since=<unix time>` | Active alarms, plus those raised or cleared since that time |
+| `GET /api/events?since=<unix time>` | Inverter status changes seen since that time, for example `Standby: no sunlight` to `On-grid` |
+
+```json
+{
+  "updated": 1790926529,
+  "alarms": [
+    {
+      "id": "1459031387",
+      "station_code": "NE=12345678",
+      "station_name": "Plant A",
+      "device_id": "NE=12345680",
+      "device_name": "INV-1",
+      "device_type": "Inverter",
+      "sn": "6T00000000",
+      "alarm_id": "2012",
+      "name": "String current backfeed",
+      "severity": 4,
+      "occurred": 1790515706,
+      "cleared": 1790515791,
+      "detail": "Alarm No.:792"
+    }
+  ]
+}
+```
+
+`severity` is 1 critical, 2 major, 3 minor, 4 warning. `cleared` is `null` while the alarm is active. Times are Unix seconds.
+
+Things to keep in mind:
+
+- The portal keeps alarm history for a limited time (about two months in my case). Store the alarms on your side if you need them longer.
+- Status changes are detected by the exporter while it runs and are kept in memory (the last 5000). They start empty after a restart, so read them regularly.
+- Like `/metrics`, these endpoints have no authentication. Keep the port inside your monitoring network.
 
 ## Good to know
 

@@ -6,17 +6,20 @@ pages use. All settings come from environment variables, see .env.example.
 """
 
 import base64
+import json
 import logging
 import os
 import secrets
 import threading
 import time
 import urllib.parse
+from socketserver import ThreadingMixIn
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from prometheus_client import Counter, Gauge, start_http_server
+from prometheus_client import Counter, Gauge, make_wsgi_app
 
 LOGIN_URL = os.environ.get("FUSIONSOLAR_LOGIN_URL", "https://eu5.fusionsolar.huawei.com").rstrip("/")
 # leave empty to use the regional host the login redirects to
@@ -28,6 +31,10 @@ INVENTORY_TTL = int(os.environ.get("INVENTORY_TTL_SECONDS", "21600"))
 LOGIN_BACKOFF = int(os.environ.get("LOGIN_BACKOFF_SECONDS", "1800"))
 TZ_OFFSET = float(os.environ.get("TIMEZONE_OFFSET_HOURS", "0"))
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9850"))
+# Alarm list and inverter status changes, served as JSON on /api/alarms and /api/events
+ALARM_INTERVAL = int(os.environ.get("ALARM_INTERVAL_SECONDS", "300"))
+ALARM_HISTORY_DAYS = int(os.environ.get("ALARM_HISTORY_DAYS", "3650"))
+EVENT_LIMIT = 5000
 HTTP_TIMEOUT = 30
 
 INVERTER_MOC = 20822
@@ -39,6 +46,7 @@ SIG_TOTAL_ENERGY = 10029
 SIG_TEMPERATURE = 10023
 SIG_RATED_POWER = 10006
 SIG_FREQUENCY = 10021
+SIG_STATUS = 10025
 SIG_PHASE_VOLTAGE = {"A": 10011, "B": 10012, "C": 10013}
 SIG_PHASE_CURRENT = {"A": 10014, "B": 10015, "C": 10016}
 # PV string signals in device-real-kpi: voltage 11001 + 3n, current 11002 + 3n
@@ -232,11 +240,76 @@ def local_midnight_ms():
 HEALTH = {"connected": 3, "disconnected": 1}
 
 
+class LogStore:
+    """Alarms and status changes kept in memory for the JSON endpoints."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.alarms = {}
+        self.events = []
+        self.alarms_at = 0
+
+    def put_alarms(self, alarms, active_ids, now):
+        with self.lock:
+            for alarm in alarms:
+                self.alarms[alarm["id"]] = alarm
+            # an alarm that left the active list without a history row was cleared in between
+            for alarm in self.alarms.values():
+                if alarm["cleared"] is None and alarm["id"] not in active_ids:
+                    alarm["cleared"] = now
+            self.alarms_at = now
+
+    def add_event(self, event):
+        with self.lock:
+            self.events.append(event)
+            del self.events[:-EVENT_LIMIT]
+
+    def alarms_since(self, since):
+        with self.lock:
+            rows = [a for a in self.alarms.values()
+                    if a["cleared"] is None or a["occurred"] >= since or a["cleared"] >= since]
+            return {"updated": self.alarms_at, "alarms": sorted(rows, key=lambda a: a["occurred"])}
+
+    def events_since(self, since):
+        with self.lock:
+            return {"events": [e for e in self.events if e["ts"] >= since]}
+
+
+STORE = LogStore()
+
+
+def clean_text(value):
+    text = " ".join(str(value or "").split())
+    return text.replace(" :", ":")
+
+
+def alarm_row(hit):
+    cleared = int(hit.get("cleared") or 0) == 1 and hit.get("clearUtc")
+    return {
+        "id": str(hit.get("csn")),
+        "station_code": hit.get("nativeMeDn") or "",
+        "station_name": hit.get("meName") or "",
+        "device_id": hit.get("nativeMoDn") or "",
+        "device_name": hit.get("devNameStr") or "",
+        "device_type": hit.get("devTypeStr") or "",
+        "sn": hit.get("esn") or "",
+        "alarm_id": str(hit.get("alarmId") or ""),
+        "name": hit.get("alarmName") or "",
+        "severity": int(hit.get("severity") or 0),
+        "occurred": int((hit.get("occurUtc") or 0) / 1000),
+        "cleared": int(hit["clearUtc"] / 1000) if cleared else None,
+        "detail": hit.get("additionalInformation") or "",
+    }
+
+
 class Collector:
     def __init__(self):
         self.portal = Portal()
         self.inverters = {}   # station dn -> list of device dicts
         self.inventory_at = 0
+        self.alarms_at = 0
+        self.alarm_history_loaded = False
+        self.status = {}      # device dn -> last status text
 
     def fetch_stations(self):
         stations, page = [], 1
@@ -283,6 +356,7 @@ class Collector:
         set_gauge(INV_TOTAL, labels, signals.get(SIG_TOTAL_ENERGY))
         set_gauge(INV_TEMP, labels, signals.get(SIG_TEMPERATURE))
         set_gauge(INV_FREQ, labels, signals.get(SIG_FREQUENCY))
+        self.track_status(station, dev, clean_text(signals.get(SIG_STATUS)) or "No data")
         for phase, sig in SIG_PHASE_VOLTAGE.items():
             set_gauge(INV_PHASE_VOLTAGE, labels + (phase,), signals.get(sig))
         for phase, sig in SIG_PHASE_CURRENT.items():
@@ -320,6 +394,49 @@ class Collector:
         if seen:
             INV_DC_POWER.labels(*labels).set(round(total, 3))
 
+    def track_status(self, station, dev, text):
+        before = self.status.get(dev["dn"])
+        self.status[dev["dn"]] = text
+        if before is None or before == text:
+            return
+        now = int(time.time())
+        STORE.add_event({
+            "id": f"{dev['dn']}:{now}", "ts": now,
+            "station_code": station["dn"], "station_name": station.get("name") or "",
+            "device_id": dev["dn"], "device_name": dev.get("name") or "",
+            "from": before, "to": text,
+        })
+
+    def fetch_alarms(self, data_type, begin_ms):
+        rows, page = [], 1
+        while page <= 50:
+            body = self.portal.post("/rest/pvms/fm/v1/query", {
+                "dataType": data_type, "domainType": "OC_SOLAR", "pageNo": page, "pageSize": 100,
+                "nativeMeDn": "", "nativeMoDn": [],
+                "occurUTC": {"begin": begin_ms, "end": int(time.time() * 1000)},
+                "sort": {"field": "occurUtc", "order": "desc"},
+            })
+            if not body.get("success"):
+                raise RuntimeError(f"alarm query failCode={body.get('failCode')}")
+            data = body.get("data") or {}
+            hits = data.get("hits") or []
+            rows += [alarm_row(h) for h in hits]
+            if not hits or len(rows) >= int(data.get("totalCount") or 0):
+                break
+            page += 1
+        return rows
+
+    def poll_alarms(self):
+        now = int(time.time())
+        days = 14 if self.alarm_history_loaded else ALARM_HISTORY_DAYS
+        active = self.fetch_alarms("CURRENT", (now - ALARM_HISTORY_DAYS * 86400) * 1000)
+        for alarm in active:
+            alarm["cleared"] = None
+        history = self.fetch_alarms("HISTORY", (now - days * 86400) * 1000)
+        STORE.put_alarms(history + active, {a["id"] for a in active}, now)
+        self.alarm_history_loaded = True
+        self.alarms_at = time.time()
+
     def poll_once(self):
         self.portal.ensure_session()
         stations = self.fetch_stations()
@@ -343,6 +460,15 @@ class Collector:
         alarms = self.portal.get("/rest/pvms/fm/v1/statistic")
         for row in alarms.get("data") or []:
             set_gauge(ALARMS, (str(row.get("severity")),), row.get("value"))
+        if time.time() - self.alarms_at >= ALARM_INTERVAL:
+            try:
+                self.poll_alarms()
+            except SessionExpired:
+                raise
+            except Exception as exc:
+                self.alarms_at = time.time()
+                ERRORS.labels("alarms").inc()
+                log.warning("alarm list failed: %s", exc)
 
         self.refresh_inventory(stations)
         for s in stations:
@@ -367,15 +493,42 @@ class Collector:
             time.sleep(max(5, POLL_INTERVAL - (time.time() - started)))
 
 
+METRICS_APP = make_wsgi_app()
+
+
+def http_app(environ, start_response):
+    path = environ.get("PATH_INFO", "")
+    if path not in ("/api/alarms", "/api/events"):
+        return METRICS_APP(environ, start_response)
+    query = urllib.parse.parse_qs(environ.get("QUERY_STRING", ""))
+    try:
+        since = int(float(query.get("since", ["0"])[0]))
+    except ValueError:
+        since = 0
+    data = STORE.alarms_since(since) if path == "/api/alarms" else STORE.events_since(since)
+    body = json.dumps(data, ensure_ascii=False).encode()
+    start_response("200 OK", [("Content-Type", "application/json; charset=utf-8"),
+                              ("Content-Length", str(len(body)))])
+    return [body]
+
+
+class QuietHandler(WSGIRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+class ThreadingServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+
+
 def main():
     logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(message)s")
     if not USERNAME or not PASSWORD:
         raise SystemExit("FUSIONSOLAR_USERNAME and FUSIONSOLAR_PASSWORD must be set")
-    start_http_server(LISTEN_PORT)
+    server = make_server("", LISTEN_PORT, http_app, ThreadingServer, handler_class=QuietHandler)
     log.info("serving metrics on :%d, polling every %ds", LISTEN_PORT, POLL_INTERVAL)
     threading.Thread(target=Collector().run, daemon=True).start()
-    while True:
-        time.sleep(3600)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
